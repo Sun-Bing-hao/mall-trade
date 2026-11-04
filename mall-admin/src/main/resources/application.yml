@@ -48,7 +48,6 @@ secure:
       - /admin/logout
       - /minio/upload
       - /aliyun/oss/policy
-
 springdoc:
   swagger-ui:
     # 修改Swagger UI路径

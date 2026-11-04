@@ -1,0 +1,77 @@
+### ============================================================
+### mall-portal 接口调试脚本 (IDEA HTTP Client)
+### 用法：点击每个请求左侧行号旁的绿色三角运行
+### token 会在"登录"请求执行后自动写入，后续请求自动复用一个
+### ============================================================
+
+### 1. 会员登录（成功后自动保存 token 到全局变量）
+POST http://localhost:8085/sso/login?username=test&password=123456
+Accept: application/json
+
+> {%
+    client.test("登录成功", function() {
+        client.assert(response.status === 200, "HTTP 状态异常");
+        client.assert(response.body.code === 200, "登录失败: " + response.body.message);
+    });
+    client.global.set("token", response.body.data.token);
+    client.log("token 已保存: " + response.body.data.token.substring(0, 20) + "...");
+%}
+
+### 2. 验证鉴权（返回会员信息即 token 有效）
+GET http://localhost:8085/sso/info
+Authorization: Bearer {{token}}
+Accept: application/json
+
+### 3. 加入购物车（商品26 / SKU 110 / 数量2）
+POST http://localhost:8085/cart/add
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "productId": 26,
+  "productSkuId": 110,
+  "quantity": 2
+}
+
+### 4. 查看购物车（记下返回的 id，填到下面两个请求的 cartIds 里）
+GET http://localhost:8085/cart/list
+Authorization: Bearer {{token}}
+Accept: application/json
+
+> {%
+    var list = response.body.data;
+    if (list && list.length > 0) {
+        client.global.set("cartId", list[0].id);
+        client.log("cartId 已保存: " + list[0].id);
+    }
+%}
+
+### 5. 生成确认单（只算价，不写库）
+POST http://localhost:8085/order/generateConfirmOrder
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[ {{cartId}} ]
+
+### 6. 下单（核心：锁库存 + 写订单 + 发延迟消息）
+POST http://localhost:8085/order/generateOrder
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "memberReceiveAddressId": 4,
+  "payType": 1,
+  "cartIds": [ {{cartId}} ]
+}
+
+> {%
+    if (response.body.code === 200) {
+        client.global.set("orderId", response.body.data.order.id);
+        client.log("订单创建成功, orderId: " + response.body.data.order.id);
+    }
+%}
+
+### 7. 查看订单列表
+GET http://localhost:8085/order/list?status=-1&pageNum=1&pageSize=5
+Authorization: Bearer {{token}}
+Accept: application/json
