@@ -143,6 +143,18 @@ public class StockLockAtomicTest {
         System.out.println("========================================================");
         System.out.println();
 
+        // 落一份到文件，便于和 Redis 预扣版本做同批次对比
+        String summary = String.format(
+                "并发=%d 库存=%d 成功=%d 售罄=%d 异常=%d 耗时=%dms 吞吐=%.1f/s DB锁定量=%d",
+                THREADS, STOCK, success.get(), soldOut.get(), error.get(), cost, tps, locked);
+        try {
+            java.nio.file.Files.writeString(
+                    java.nio.file.Path.of("target", "stock-db-only-benchmark.txt"),
+                    summary, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception ignored) {
+            // 写文件失败不影响测试结论
+        }
+
         // ① 不能超卖：锁定量绝不能超过真实库存
         assertTrue(locked <= STOCK, "出现超卖：lock_stock=" + locked + " 超过库存 " + STOCK);
         // ② 不能少卖：库存卖完就该正好卖出 100 件

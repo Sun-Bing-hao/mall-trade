@@ -9,6 +9,7 @@ import com.macro.mall.common.service.RedisService;
 import com.macro.mall.mapper.*;
 import com.macro.mall.model.*;
 import com.macro.mall.portal.component.CancelOrderSender;
+import com.macro.mall.portal.component.SkuStockCache;
 import com.macro.mall.portal.dao.PortalOrderDao;
 import com.macro.mall.portal.dao.PortalOrderItemDao;
 import com.macro.mall.portal.dao.SmsCouponHistoryDao;
@@ -18,6 +19,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.CollectionUtils;
 
 import java.math.BigDecimal;
@@ -64,6 +67,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     private OmsOrderItemMapper orderItemMapper;
     @Autowired
     private CancelOrderSender cancelOrderSender;
+    @Autowired
+    private SkuStockCache skuStockCache;
 
     @Override
     public ConfirmOrderResult generateConfirmOrder(List<Long> cartIds) {
@@ -282,6 +287,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         for (OmsOrderDetail timeOutOrder : timeOutOrders) {
             //解除订单商品库存锁定
             portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList());
+            //同步归还 Redis 可售库存，否则这部分库存会永久无法售出
+            releaseCacheStock(timeOutOrder.getOrderItemList());
             //修改优惠券使用状态
             updateCouponStatus(timeOutOrder.getCouponId(), timeOutOrder.getMemberId(), 0);
             //返还使用积分
@@ -313,6 +320,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
             //解除订单商品库存锁定
             if (!CollectionUtils.isEmpty(orderItemList)) {
                 portalOrderDao.releaseSkuStockLock(orderItemList);
+                //同步归还 Redis 可售库存，否则这部分库存会永久无法售出
+                releaseCacheStock(orderItemList);
             }
             //修改优惠券使用状态
             updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), 0);
@@ -729,25 +738,25 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     /**
-     * 锁定下单商品的所有库存
+     * 锁定下单商品的所有库存（两级防线）
      *
-     * <p>改造前（读-改-写，存在竞态）：
-     * <pre>
-     *   PmsSkuStock skuStock = skuStockMapper.selectByPrimaryKey(skuId);
-     *   skuStock.setLockStock(skuStock.getLockStock() + quantity);
-     *   skuStockMapper.updateByPrimaryKeySelective(skuStock);
-     * </pre>
-     * 两个并发请求会读到同一个旧值，各自加完再写回，后写的覆盖先写的。
-     * 实测 200 并发各锁 1 件，最终 lock_stock 只留下 3。
+     * <p>历史问题：原实现是「select → setLockStock(+n) → update」的读-改-写，
+     * 并发下互相覆盖锁定量，实测 200 并发各锁 1 件最终只留下 3，超卖成立。
      *
-     * <p>改造后把「判断可用库存」和「增加锁定量」合并成一条带 WHERE 条件的 UPDATE，
-     * 交给 InnoDB 行锁串行化：
+     * <p>第一级 · Redis 原子预扣（{@link SkuStockCache}）：
+     * 在内存里用 Lua 脚本完成「判断 + 扣减」，抢不到库存的请求直接在这里失败，
+     * 不产生任何数据库访问。这是性能层，不承担最终正确性。
+     *
+     * <p>第二级 · 数据库原子更新（{@link PortalOrderDao#lockSkuStock}）：
      * <pre>
      *   UPDATE pms_sku_stock SET lock_stock = lock_stock + #{quantity}
      *    WHERE id = #{skuId} AND stock - lock_stock &gt;= #{quantity}
      * </pre>
-     * 影响行数为 0 说明可用库存不足，抛异常由 {@code generateOrder()} 上的
-     * {@code @Transactional} 回滚整笔订单（包含前面已经锁定的其他商品）。
+     * 判断与扣减在同一条 SQL 内、由 InnoDB 行锁串行化，这是正确性层。
+     * 即使 Redis 计数出现偏差，这里也绝不会超卖。
+     *
+     * <p>一致性保证：任何一步失败都会把本次已预扣的额度归还 Redis；
+     * 订单后续环节失败导致事务回滚时，通过事务同步回调统一归还。
      */
     private void lockStock(List<CartPromotionItem> cartPromotionItemList) {
         // 按 skuId 升序加锁：多个订单并发时加锁顺序一致，避免 A 锁住 1 等 2、B 锁住 2 等 1 形成死锁。
@@ -755,12 +764,62 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         List<CartPromotionItem> sortedList = cartPromotionItemList.stream()
                 .sorted(Comparator.comparing(CartPromotionItem::getProductSkuId))
                 .collect(Collectors.toList());
-        for (CartPromotionItem cartPromotionItem : sortedList) {
-            int affected = portalOrderDao.lockSkuStock(
-                    cartPromotionItem.getProductSkuId(), cartPromotionItem.getQuantity());
-            if (affected == 0) {
-                Asserts.fail("库存不足，无法下单");
+
+        List<CartPromotionItem> deductedList = new ArrayList<>();
+        try {
+            for (CartPromotionItem cartPromotionItem : sortedList) {
+                Long skuId = cartPromotionItem.getProductSkuId();
+                Integer quantity = cartPromotionItem.getQuantity();
+                // 第一级：Redis 预扣，挡掉绝大部分无效请求
+                if (!skuStockCache.tryDeduct(skuId, quantity)) {
+                    Asserts.fail("库存不足，无法下单");
+                }
+                deductedList.add(cartPromotionItem);
+                // 第二级：数据库原子锁定，保证最终不超卖
+                if (portalOrderDao.lockSkuStock(skuId, quantity) == 0) {
+                    Asserts.fail("库存不足，无法下单");
+                }
             }
+        } catch (RuntimeException e) {
+            // 本次下单在锁定阶段失败，把已经预扣的额度全部还回去
+            rollbackDeducted(deductedList);
+            throw e;
+        }
+        // 锁定成功但整笔订单后续失败（如订单落库异常）时，事务回滚，这里同步归还 Redis
+        registerRollbackOnTransactionFailure(deductedList);
+    }
+
+    /**
+     * 注册事务回调：只有事务最终提交才保留 Redis 的预扣，回滚则归还。
+     * 否则数据库的 lock_stock 被回滚了，Redis 的扣减却留着，会导致库存越卖越少。
+     */
+    private void registerRollbackOnTransactionFailure(List<CartPromotionItem> deductedList) {
+        if (deductedList.isEmpty() || !TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                    rollbackDeducted(deductedList);
+                }
+            }
+        });
+    }
+
+    private void rollbackDeducted(List<CartPromotionItem> deductedList) {
+        for (CartPromotionItem item : deductedList) {
+            skuStockCache.rollback(item.getProductSkuId(), item.getQuantity());
+        }
+    }
+
+    /**
+     * 订单取消时同步归还 Redis 可售库存。
+     * 数据库的 lock_stock 减少后，可售量增加，缓存必须跟着加回来，否则这部分库存永远卖不出去。
+     */
+    private void releaseCacheStock(List<OmsOrderItem> orderItemList) {
+        for (OmsOrderItem orderItem : orderItemList) {
+            skuStockCache.rollback(orderItem.getProductSkuId(), orderItem.getProductQuantity());
         }
     }
 
