@@ -47,6 +47,22 @@
             AND o.create_time &lt; date_add(NOW(), INTERVAL -#{minute} MINUTE);
     </select>
 
+    <!--
+        原子锁定库存。
+        关键点：
+        1. lock_stock = lock_stock + #{quantity} 是「增量更新」，不再依赖 Java 侧读出来的旧值，
+           两个并发请求不会互相覆盖；
+        2. WHERE 里带 stock - lock_stock >= #{quantity}，把「校验」和「扣减」放进同一条 SQL，
+           由 InnoDB 行锁串行化，库存不足时影响行数为 0；
+        3. 调用方根据返回值判断是否成功，返回 0 即抛异常回滚整个下单事务。
+    -->
+    <update id="lockSkuStock">
+        UPDATE pms_sku_stock
+        SET lock_stock = lock_stock + #{quantity}
+        WHERE id = #{skuId}
+          AND stock - lock_stock &gt;= #{quantity}
+    </update>
+
     <update id="updateSkuStock">
         UPDATE pms_sku_stock
         SET
