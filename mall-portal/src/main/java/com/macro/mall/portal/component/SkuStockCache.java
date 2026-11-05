@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.util.Collections;
+import java.util.UUID;
 
 /**
  * SKU 可售库存的 Redis 预扣组件（下单库存的第一道防线）
@@ -46,6 +47,13 @@ public class SkuStockCache {
     private static final long CACHE_TTL_SECONDS = 30 * 60L;
 
     /**
+     * 缓存加载锁（loading key）的超时时间。
+     * 首要作用是防止持锁进程崩溃后锁永久不释放；正常路径靠 finally 主动解锁。
+     * 取值要远大于一次数据库查询的耗时（毫秒级），留足 1000 倍余量。
+     */
+    private static final long LOAD_LOCK_TTL_SECONDS = 10L;
+
+    /**
      * 预扣脚本。整段脚本在 Redis 单线程中执行，因此「读取-比较-扣减」天然原子，
      * 不会出现多条命令之间被其他请求插队的情况。
      *
@@ -65,6 +73,23 @@ public class SkuStockCache {
 
     private static final DefaultRedisScript<Long> DEDUCT_SCRIPT =
             new DefaultRedisScript<>(DEDUCT_LUA, Long.class);
+
+    /**
+     * 解锁脚本：只有锁的值仍然是自己写入的 token 时才删除。
+     *
+     * <p>为什么不能先 {@code get} 再 {@code delete}：两条命令之间锁可能刚好过期并被别的线程抢走，
+     * 这时删掉的就是别人的锁，会导致更多线程重复回源。放进 Lua 里，Redis 单线程执行整段脚本，
+     * 「比较 + 删除」成为一个原子操作。
+     */
+    private static final String UNLOCK_LUA = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            end
+            return 0
+            """;
+
+    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT =
+            new DefaultRedisScript<>(UNLOCK_LUA, Long.class);
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
@@ -130,12 +155,17 @@ public class SkuStockCache {
      * 缓存刚过期或首次访问时，如果所有并发请求同时回源，会把数据库打满（缓存击穿），
      * 而且 300ms 的 Redis 命令超时很容易被拖爆。
      * 抢不到加载权的线程直接返回，由调用方决定降级放行。
+     *
+     * <p>锁的值用 UUID 而不是固定字符串：解锁时要能确认「这把锁还是我加的」。
+     * 否则持锁线程执行超过 TTL 后，它的 finally 会把后来者的锁删掉（误删他人锁）。
+     * 没有用线程 id 是因为它跨 JVM 会重复，而锁的持有者是「一次请求」而非「一个线程」。
      */
     public void initStock(Long skuId) {
         String key = key(skuId);
         String loadLockKey = key + ":loading";
+        String token = UUID.randomUUID().toString();
         Boolean acquired = stringRedisTemplate.opsForValue()
-                .setIfAbsent(loadLockKey, "1", Duration.ofSeconds(3));
+                .setIfAbsent(loadLockKey, token, Duration.ofSeconds(LOAD_LOCK_TTL_SECONDS));
         if (!Boolean.TRUE.equals(acquired)) {
             return;
         }
@@ -149,7 +179,22 @@ public class SkuStockCache {
             stringRedisTemplate.opsForValue()
                     .setIfAbsent(key, String.valueOf(available), Duration.ofSeconds(CACHE_TTL_SECONDS));
         } finally {
-            stringRedisTemplate.delete(loadLockKey);
+            unlock(loadLockKey, token);
+        }
+    }
+
+    /**
+     * 释放加载锁。用 Lua 保证「比对 token + 删除」的原子性。
+     * 解锁失败不能影响主流程（锁本身有 TTL 会自行过期），所以这里吞掉异常。
+     *
+     * @param lockKey 锁的 key（{@code mall:stock:sku:{skuId}:loading}）
+     * @param token   加锁时写入的唯一标识，只有与当前锁值一致才会删除
+     */
+    public void unlock(String lockKey, String token) {
+        try {
+            stringRedisTemplate.execute(UNLOCK_SCRIPT, Collections.singletonList(lockKey), token);
+        } catch (Exception e) {
+            log.warn("释放库存加载锁失败，等待自动过期，lockKey={}", lockKey, e);
         }
     }
 
@@ -157,6 +202,37 @@ public class SkuStockCache {
     public Integer getCachedStock(Long skuId) {
         String value = stringRedisTemplate.opsForValue().get(key(skuId));
         return value == null ? null : Integer.valueOf(value);
+    }
+
+    /**
+     * 用数据库的可售量覆盖缓存（对账修正用）。
+     * 顺便重置 TTL：既然刚和数据库对齐过，重新计时是合理的。
+     */
+    public void reset(Long skuId, int available) {
+        stringRedisTemplate.opsForValue()
+                .set(key(skuId), String.valueOf(Math.max(0, available)),
+                        Duration.ofSeconds(CACHE_TTL_SECONDS));
+    }
+
+    /** 清除某个 SKU 的库存缓存（SKU 被删除时使用） */
+    public void evict(Long skuId) {
+        stringRedisTemplate.delete(key(skuId));
+    }
+
+    /**
+     * 从缓存 key 解析出 skuId，解析失败返回 null。
+     * 注意 {@code mall:stock:sku:110:loading} 这类内部 key 也会被 SCAN 匹配到，
+     * 这里通过「后缀必须是纯数字」把它们过滤掉。
+     */
+    public static Long parseSkuId(String key) {
+        if (key == null || !key.startsWith(KEY_PREFIX)) {
+            return null;
+        }
+        try {
+            return Long.valueOf(key.substring(KEY_PREFIX.length()));
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private Long executeDeduct(String key, Integer quantity) {

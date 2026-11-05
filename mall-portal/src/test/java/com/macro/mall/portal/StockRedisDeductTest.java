@@ -12,6 +12,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.context.TestPropertySource;
 
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -19,6 +20,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -203,5 +205,32 @@ public class StockRedisDeductTest {
         assertEquals(before, skuStockCache.getCachedStock(SKU_ID), "归还后可售量应恢复");
 
         System.out.println("归还验证通过：预扣 10 件后归还，缓存值 " + before + " 保持不变");
+    }
+
+    /**
+     * 验证加载锁不会误删他人锁。
+     *
+     * <p>场景：线程 A 持锁执行超过 TTL，锁自动过期；线程 B 抢到新锁；
+     * A 执行完 finally 时拿着自己的旧 token 去解锁，**不能**把 B 的锁删掉。
+     * 这是用 UUID + Lua 校验替代「固定值 + 直接 delete」的原因。
+     */
+    @Test
+    public void shouldNotDeleteLockOwnedByOthers() {
+        String lockKey = SkuStockCache.cacheKey(SKU_ID) + ":loading";
+
+        // 模拟：A 的锁已过期，B 拿到新锁
+        stringRedisTemplate.opsForValue().set(lockKey, "token-B", Duration.ofMinutes(1));
+
+        // A 执行完，拿着自己的旧 token 来解锁
+        skuStockCache.unlock(lockKey, "token-A");
+        assertEquals("token-B", stringRedisTemplate.opsForValue().get(lockKey),
+                "A 不应该删掉 B 的锁");
+
+        // B 自己来解锁，应当成功
+        skuStockCache.unlock(lockKey, "token-B");
+        assertNull(stringRedisTemplate.opsForValue().get(lockKey),
+                "持有正确 token 时应能正常释放锁");
+
+        System.out.println("锁归属校验通过：旧持有者无法删除新持有者的锁");
     }
 }
