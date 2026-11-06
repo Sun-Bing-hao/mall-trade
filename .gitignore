@@ -1,0 +1,18 @@
+# Maven #
+target/
+
+# IDEA #
+.idea/
+*.iml
+
+# Eclipse #
+.settings/
+.classpath
+.project
+
+# WorkBuddy 个人记忆目录 #
+.workbuddy/
+
+# 本地日志与临时文件 #
+*.log
+.tmp/
