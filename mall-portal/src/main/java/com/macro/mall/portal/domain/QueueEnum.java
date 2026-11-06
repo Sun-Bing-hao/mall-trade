@@ -15,7 +15,12 @@ public enum QueueEnum {
     /**
      * 消息通知ttl队列
      */
-    QUEUE_TTL_ORDER_CANCEL("mall.order.direct.ttl", "mall.order.cancel.ttl", "mall.order.cancel.ttl");
+    QUEUE_TTL_ORDER_CANCEL("mall.order.direct.ttl", "mall.order.cancel.ttl", "mall.order.cancel.ttl"),
+    /**
+     * 订单取消失败的兜底队列。
+     * 重试次数耗尽后消息被转投到这里，避免异常消息阻塞正常订单的取消消费。
+     */
+    QUEUE_ORDER_CANCEL_ERROR("mall.order.direct.error", "mall.order.cancel.error", "mall.order.cancel.error");
 
     /**
      * 交换名称

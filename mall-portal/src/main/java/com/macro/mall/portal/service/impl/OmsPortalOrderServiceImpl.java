@@ -35,6 +35,12 @@ import java.util.stream.Collectors;
  */
 @Service
 public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
+
+    /** 订单状态：待付款 */
+    private static final int ORDER_STATUS_PENDING = 0;
+    /** 订单状态：已关闭（超时取消或用户主动取消） */
+    private static final int ORDER_STATUS_CLOSED = 4;
+
     @Autowired
     private UmsMemberService memberService;
     @Autowired
@@ -301,36 +307,59 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public void cancelOrder(Long orderId) {
-        //查询未付款的取消订单
-        OmsOrderExample example = new OmsOrderExample();
-        example.createCriteria().andIdEqualTo(orderId).andStatusEqualTo(0).andDeleteStatusEqualTo(0);
-        List<OmsOrder> cancelOrderList = orderMapper.selectByExample(example);
-        if (CollectionUtils.isEmpty(cancelOrderList)) {
+        //先读一次，拿到优惠券、积分等后续要用到的字段
+        OmsOrder cancelOrder = orderMapper.selectByPrimaryKey(orderId);
+        if (cancelOrder == null) {
             return;
         }
-        OmsOrder cancelOrder = cancelOrderList.get(0);
-        if (cancelOrder != null) {
-            //修改订单状态为取消
-            cancelOrder.setStatus(4);
-            orderMapper.updateByPrimaryKeySelective(cancelOrder);
-            OmsOrderItemExample orderItemExample = new OmsOrderItemExample();
-            orderItemExample.createCriteria().andOrderIdEqualTo(orderId);
-            List<OmsOrderItem> orderItemList = orderItemMapper.selectByExample(orderItemExample);
-            //解除订单商品库存锁定
-            if (!CollectionUtils.isEmpty(orderItemList)) {
-                portalOrderDao.releaseSkuStockLock(orderItemList);
-                //同步归还 Redis 可售库存，否则这部分库存会永久无法售出
+        //状态机 CAS：只有仍处于「待付款」的订单才能被本次调用关闭。
+        //影响行数为 0 说明订单已被支付 / 已被其它线程取消 / 已被删除，本次直接退出。
+        //这一行同时取代了原来的「先查 status=0 再 update」，消除了检查与修改之间的竞态窗口。
+        int affected = portalOrderDao.updateOrderStatusFrom(orderId, ORDER_STATUS_CLOSED, ORDER_STATUS_PENDING);
+        if (affected == 0) {
+            return;
+        }
+        //以下操作与状态更新处于同一个事务，任一环节失败整体回滚
+        OmsOrderItemExample orderItemExample = new OmsOrderItemExample();
+        orderItemExample.createCriteria().andOrderIdEqualTo(orderId);
+        List<OmsOrderItem> orderItemList = orderItemMapper.selectByExample(orderItemExample);
+        //解除订单商品库存锁定
+        if (!CollectionUtils.isEmpty(orderItemList)) {
+            portalOrderDao.releaseSkuStockLock(orderItemList);
+            //Redis 的归还推迟到事务提交后，避免回滚后缓存凭空多出库存
+            registerCacheReleaseAfterCommit(orderItemList);
+        }
+        //修改优惠券使用状态
+        updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), 0);
+        //返还使用积分
+        if (cancelOrder.getUseIntegration() != null) {
+            UmsMember member = memberService.getById(cancelOrder.getMemberId());
+            memberService.updateIntegration(cancelOrder.getMemberId(), member.getIntegration() + cancelOrder.getUseIntegration());
+        }
+    }
+
+    /**
+     * 把「归还 Redis 可售库存」推迟到事务提交之后执行。
+     *
+     * <p>如果在事务内直接归还，一旦事务回滚，数据库的 lock_stock 会被还原，
+     * 但缓存里的可售量已经加回去了，可售量就会虚高（虽然对账任务能在一分钟内修正，
+     * 但没有必要主动制造偏差）。
+     *
+     * <p>若当前没有事务（例如被非事务方法调用），则退化为立即执行。
+     */
+    private void registerCacheReleaseAfterCommit(List<OmsOrderItem> orderItemList) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            releaseCacheStock(orderItemList);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
                 releaseCacheStock(orderItemList);
             }
-            //修改优惠券使用状态
-            updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), 0);
-            //返还使用积分
-            if (cancelOrder.getUseIntegration() != null) {
-                UmsMember member = memberService.getById(cancelOrder.getMemberId());
-                memberService.updateIntegration(cancelOrder.getMemberId(), member.getIntegration() + cancelOrder.getUseIntegration());
-            }
-        }
+        });
     }
 
     @Override

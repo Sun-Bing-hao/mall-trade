@@ -82,6 +82,20 @@
             #{item.productSkuId}
         </foreach>
     </update>
+    <!--
+        状态机 CAS：只有当前状态等于 expectFrom 时才更新。
+        订单取消、支付回调都靠这条 SQL 实现「只会成功一次」的幂等：
+        并发调用时只有一个请求的影响行数为 1，其余为 0。
+    -->
+    <update id="updateOrderStatusFrom">
+        UPDATE oms_order
+        SET status      = #{status},
+            modify_time = NOW()
+        WHERE id = #{orderId}
+          AND status = #{expectFrom}
+          AND delete_status = 0
+    </update>
+
     <update id="updateOrderStatus">
         update oms_order
         set status=#{status}

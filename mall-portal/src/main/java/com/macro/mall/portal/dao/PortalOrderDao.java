@@ -45,6 +45,24 @@ public interface PortalOrderDao {
     int updateOrderStatus(@Param("ids") List<Long> ids,@Param("status") Integer status);
 
     /**
+     * 仅当订单仍处于「待付款」时修改其状态（状态机 CAS）。
+     *
+     * <p>把「检查状态」和「修改状态」合并成一条带 WHERE 条件的 UPDATE，
+     * 由数据库行锁保证原子性，用于订单取消、支付回调等「只能成功一次」的场景。
+     *
+     * <p>调用方根据返回值判断自己是否抢到了这次状态流转：
+     * 返回 1 表示本次操作生效；返回 0 表示订单不存在、已被支付、已被取消或已删除。
+     *
+     * @param orderId    订单 id
+     * @param status     目标状态
+     * @param expectFrom 期望的当前状态（通常是 0 待付款）
+     * @return 影响行数
+     */
+    int updateOrderStatusFrom(@Param("orderId") Long orderId,
+                              @Param("status") Integer status,
+                              @Param("expectFrom") Integer expectFrom);
+
+    /**
      * 解除取消订单的库存锁定
      */
     int releaseSkuStockLock(@Param("itemList") List<OmsOrderItem> orderItemList);
