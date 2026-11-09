@@ -33,12 +33,6 @@ public interface OmsPortalOrderService {
     Integer paySuccess(Long orderId, Integer payType);
 
     /**
-     * 自动取消超时订单
-     */
-    @Transactional
-    Integer cancelTimeOutOrder();
-
-    /**
      * 取消单个超时订单
      */
     @Transactional

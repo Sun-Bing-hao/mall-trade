@@ -276,37 +276,6 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     @Override
-    public Integer cancelTimeOutOrder() {
-        Integer count=0;
-        OmsOrderSetting orderSetting = orderSettingMapper.selectByPrimaryKey(1L);
-        //查询超时、未支付的订单及订单详情
-        List<OmsOrderDetail> timeOutOrders = portalOrderDao.getTimeOutOrders(orderSetting.getNormalOrderOvertime());
-        if (CollectionUtils.isEmpty(timeOutOrders)) {
-            return count;
-        }
-        //修改订单状态为交易取消
-        List<Long> ids = new ArrayList<>();
-        for (OmsOrderDetail timeOutOrder : timeOutOrders) {
-            ids.add(timeOutOrder.getId());
-        }
-        portalOrderDao.updateOrderStatus(ids, 4);
-        for (OmsOrderDetail timeOutOrder : timeOutOrders) {
-            //解除订单商品库存锁定
-            portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList());
-            //同步归还 Redis 可售库存，否则这部分库存会永久无法售出
-            releaseCacheStock(timeOutOrder.getOrderItemList());
-            //修改优惠券使用状态
-            updateCouponStatus(timeOutOrder.getCouponId(), timeOutOrder.getMemberId(), 0);
-            //返还使用积分
-            if (timeOutOrder.getUseIntegration() != null) {
-                UmsMember member = memberService.getById(timeOutOrder.getMemberId());
-                memberService.updateIntegration(timeOutOrder.getMemberId(), member.getIntegration() + timeOutOrder.getUseIntegration());
-            }
-        }
-        return timeOutOrders.size();
-    }
-
-    @Override
     @Transactional(rollbackFor = Exception.class)
     public void cancelOrder(Long orderId) {
         //先读一次，拿到优惠券、积分等后续要用到的字段

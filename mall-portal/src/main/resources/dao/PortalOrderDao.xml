@@ -26,25 +26,20 @@
             o.id = #{orderId}
     </select>
 
-    <select id="getTimeOutOrders" resultMap="orderDetailMap">
-        SELECT
-            o.id,
-            o.order_sn,
-            o.coupon_id,
-            o.integration,
-            o.member_id,
-            o.use_integration,
-            ot.id               ot_id,
-            ot.product_name     ot_product_name,
-            ot.product_sku_id   ot_product_sku_id,
-            ot.product_sku_code ot_product_sku_code,
-            ot.product_quantity ot_product_quantity
-        FROM
-            oms_order o
-            LEFT JOIN oms_order_item ot ON o.id = ot.order_id
-        WHERE
-            o.status = 0
-            AND o.create_time &lt; date_add(NOW(), INTERVAL -#{minute} MINUTE);
+    <!--
+        兜底扫描用的超时订单查询：
+        1. 不 JOIN 订单明细，扫描阶段只需要订单 id，查询尽量轻；
+        2. 带 ORDER BY + LIMIT，积压时按创建时间从早到晚分批消化，避免一次捞出几千条；
+        3. 阈值传的是「超时时间 + 宽限期」，让延迟消息先有机会处理，减少无效竞争。
+    -->
+    <select id="getTimeoutPendingOrders" resultMap="com.macro.mall.mapper.OmsOrderMapper.BaseResultMap">
+        SELECT id, order_sn, member_id, status, create_time
+        FROM oms_order
+        WHERE status = 0
+          AND delete_status = 0
+          AND create_time &lt; DATE_SUB(NOW(), INTERVAL #{minutes} MINUTE)
+        ORDER BY create_time ASC
+        LIMIT #{limit}
     </select>
 
     <!--
@@ -96,14 +91,6 @@
           AND delete_status = 0
     </update>
 
-    <update id="updateOrderStatus">
-        update oms_order
-        set status=#{status}
-        where id in
-        <foreach collection="ids" item="id" separator="," open="(" close=")">
-            #{id}
-        </foreach>
-    </update>
     <update id="releaseSkuStockLock">
         UPDATE pms_sku_stock
         SET

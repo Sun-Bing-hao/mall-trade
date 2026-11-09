@@ -1,5 +1,6 @@
 package com.macro.mall.portal.dao;
 
+import com.macro.mall.model.OmsOrder;
 import com.macro.mall.model.OmsOrderItem;
 import com.macro.mall.portal.domain.OmsOrderDetail;
 import org.apache.ibatis.annotations.Param;
@@ -34,15 +35,16 @@ public interface PortalOrderDao {
     int updateSkuStock(@Param("itemList") List<OmsOrderItem> orderItemList);
 
     /**
-     * 获取超时订单
-     * @param minute 超时时间（分）
+     * 查询「已超时仍未支付」的订单，供兜底扫描使用。
+     *
+     * <p>只取订单本体、不 JOIN 订单明细；带 LIMIT 与排序，避免积压几千单时一次性压住数据库。
+     * 拿到 id 后由调用方逐笔走 {@code cancelOrder}，取消规则只维护一份。
+     *
+     * @param minutes 超时阈值（配置的超时时间 + 宽限期）
+     * @param limit   单批最多返回多少条
      */
-    List<OmsOrderDetail> getTimeOutOrders(@Param("minute") Integer minute);
-
-    /**
-     * 批量修改订单状态
-     */
-    int updateOrderStatus(@Param("ids") List<Long> ids,@Param("status") Integer status);
+    List<OmsOrder> getTimeoutPendingOrders(@Param("minutes") Integer minutes,
+                                           @Param("limit") Integer limit);
 
     /**
      * 仅当订单仍处于「待付款」时修改其状态（状态机 CAS）。

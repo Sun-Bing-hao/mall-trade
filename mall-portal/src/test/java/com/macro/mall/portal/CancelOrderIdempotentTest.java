@@ -45,7 +45,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  */
 @SpringBootTest
 @TestPropertySource(properties = {
-        "spring.datasource.druid.max-active=60"
+        "spring.datasource.druid.max-active=60",
+        // 生产是 300ms，本机跑测试时上下文启动 + 并发会抢资源，放宽避免误报
+        "spring.data.redis.timeout=2000ms"
 })
 public class CancelOrderIdempotentTest {
 
