@@ -35,6 +35,9 @@ secure:
       - /product/**
       - /brand/**
       - /alipay/**
+      # Spring Boot 的错误转发路径：不放行的话，任何 500 都会被安全框架拦成 401，
+      # 日志里看不到真实异常，排查方向会被彻底带偏
+      - /error
 
 springdoc:
   swagger-ui:

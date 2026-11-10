@@ -91,6 +91,22 @@
           AND delete_status = 0
     </update>
 
+    <!--
+        支付成功：只允许从「待付款」流转到「已支付」。
+        时间戳交给数据库生成，避免应用服务器与数据库时钟不一致。
+        影响行数为 0 时，调用方必须放弃扣库存等后续动作。
+    -->
+    <update id="markOrderPaid">
+        UPDATE oms_order
+        SET status       = 1,
+            payment_time = NOW(),
+            pay_type     = #{payType},
+            modify_time  = NOW()
+        WHERE id = #{orderId}
+          AND status = 0
+          AND delete_status = 0
+    </update>
+
     <update id="releaseSkuStockLock">
         UPDATE pms_sku_stock
         SET

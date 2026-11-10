@@ -67,6 +67,10 @@ public class UmsMemberController {
             return CommonResult.unauthorized(null);
         }
         UmsMember member = memberService.getCurrentMember();
+        //不返回密码哈希：即便是 BCrypt 哈希，暴露出去也属于信息泄露
+        //注意：getCurrentMember 每次返回新实例（Redis 反序列化），置空不影响缓存中的原始数据；
+        //若将来改为本地缓存共用同一对象，这里需要改成返回专门的 DTO
+        member.setPassword(null);
         return CommonResult.success(member);
     }
 

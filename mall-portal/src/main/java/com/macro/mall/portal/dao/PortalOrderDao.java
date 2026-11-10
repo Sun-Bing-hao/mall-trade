@@ -65,6 +65,20 @@ public interface PortalOrderDao {
                               @Param("expectFrom") Integer expectFrom);
 
     /**
+     * 将「待付款」订单标记为已支付，同时记录支付时间与支付方式。
+     *
+     * <p>把状态判断写进 WHERE，解决两个问题：
+     * <ul>
+     *   <li>已取消（status=4）的订单收到迟到的支付回调时，不会被执行——这正是之前
+     *       「已关闭订单被复活成已支付、库存还被多扣一次」的根源；</li>
+     *   <li>重复回调（支付平台重试）只会成功一次，天然幂等。</li>
+     * </ul>
+     *
+     * @return 影响行数；0 表示订单不存在、已支付、已取消或已删除，调用方应放弃后续处理
+     */
+    int markOrderPaid(@Param("orderId") Long orderId, @Param("payType") Integer payType);
+
+    /**
      * 解除取消订单的库存锁定
      */
     int releaseSkuStockLock(@Param("itemList") List<OmsOrderItem> orderItemList);

@@ -15,6 +15,7 @@ import com.macro.mall.portal.dao.PortalOrderItemDao;
 import com.macro.mall.portal.dao.SmsCouponHistoryDao;
 import com.macro.mall.portal.domain.*;
 import com.macro.mall.portal.service.*;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -33,6 +34,7 @@ import java.util.stream.Collectors;
  * 前台订单管理Service
  * Created by macro on 2018/8/30.
  */
+@Slf4j
 @Service
 public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
@@ -104,9 +106,15 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> generateOrder(OrderParam orderParam) {
         List<OmsOrderItem> orderItemList = new ArrayList<>();
-        //校验收货地址
+        //校验收货地址：不仅不能为空，还必须是当前会员名下的有效地址。
+        //getItem 内部已按 memberId 过滤，查不到说明地址不存在或不属于当前用户，
+        //提前拦住，避免后面组装订单时对 null 取值抛 NPE 被伪装成「未登录」。
         if(orderParam.getMemberReceiveAddressId()==null){
             Asserts.fail("请选择收货地址！");
+        }
+        UmsMemberReceiveAddress address = memberReceiveAddressService.getItem(orderParam.getMemberReceiveAddressId());
+        if(address==null){
+            Asserts.fail("收货地址不存在！");
         }
         //获取购物车及优惠信息
         UmsMember currentMember = memberService.getCurrentMember();
@@ -207,8 +215,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         order.setStatus(0);
         //订单类型：0->正常订单；1->秒杀订单
         order.setOrderType(0);
-        //收货人信息：姓名、电话、邮编、地址
-        UmsMemberReceiveAddress address = memberReceiveAddressService.getItem(orderParam.getMemberReceiveAddressId());
+        //收货人信息：姓名、电话、邮编、地址（address 已在方法开头校验并查询，这里直接使用）
         order.setReceiverName(address.getName());
         order.setReceiverPhone(address.getPhoneNumber());
         order.setReceiverPostCode(address.getPostCode());
@@ -261,15 +268,16 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public Integer paySuccess(Long orderId, Integer payType) {
-        //修改订单支付状态
-        OmsOrder order = new OmsOrder();
-        order.setId(orderId);
-        order.setStatus(1);
-        order.setPaymentTime(new Date());
-        order.setPayType(payType);
-        orderMapper.updateByPrimaryKeySelective(order);
-        //恢复所有下单商品的锁定库存，扣减真实库存
+        //状态机 CAS：只有「待付款」的订单才能被标记为已支付。
+        //已取消或已支付的订单收到迟到/重复的回调时，影响行数为 0，直接返回，不扣库存。
+        int affected = portalOrderDao.markOrderPaid(orderId, payType);
+        if (affected == 0) {
+            log.warn("订单当前不是待付款状态，忽略本次支付回调，orderId={}, payType={}", orderId, payType);
+            return 0;
+        }
+        //只有真正完成状态流转，才恢复锁定库存并扣减真实库存
         OmsOrderDetail orderDetail = portalOrderDao.getDetail(orderId);
         int count = portalOrderDao.updateSkuStock(orderDetail.getOrderItemList());
         return count;
