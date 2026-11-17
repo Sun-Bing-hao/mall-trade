@@ -40,10 +40,16 @@ public interface PortalOrderDao {
      * <p>只取订单本体、不 JOIN 订单明细；带 LIMIT 与排序，避免积压几千单时一次性压住数据库。
      * 拿到 id 后由调用方逐笔走 {@code cancelOrder}，取消规则只维护一份。
      *
-     * @param minutes 超时阈值（配置的超时时间 + 宽限期）
-     * @param limit   单批最多返回多少条
+     * <p>除了上界（已超时），还带了下界（最近 N 天）。原因：如果库里存在一笔很久以前的
+     * 脏数据一直是待付款状态，它的 create_time 最小，每轮扫描都会排在最前面占用批次名额，
+     * 真正需要处理的订单反而捞不到。
+     *
+     * @param minutes   超时阈值（配置的超时时间 + 宽限期）
+     * @param maxAgeDays 只扫描最近多少天内创建的订单
+     * @param limit     单批最多返回多少条
      */
     List<OmsOrder> getTimeoutPendingOrders(@Param("minutes") Integer minutes,
+                                           @Param("maxAgeDays") Integer maxAgeDays,
                                            @Param("limit") Integer limit);
 
     /**

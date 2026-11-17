@@ -58,6 +58,13 @@ public class OrderCancelReconcileTask {
     @Value("${mall.order.cancel-scan.batch-size:100}")
     private int batchSize;
 
+    /**
+     * 只扫描最近多少天内创建的订单。
+     * 防止历史脏数据（很久以前创建却一直待付款）每轮都排在最前面、占满批次名额。
+     */
+    @Value("${mall.order.cancel-scan.max-age-days:7}")
+    private int maxAgeDays;
+
     @Autowired
     private PortalOrderDao portalOrderDao;
 
@@ -95,7 +102,7 @@ public class OrderCancelReconcileTask {
             return 0;
         }
         int thresholdMinutes = setting.getNormalOrderOvertime() + graceMinutes;
-        List<OmsOrder> orders = portalOrderDao.getTimeoutPendingOrders(thresholdMinutes, batchSize);
+        List<OmsOrder> orders = portalOrderDao.getTimeoutPendingOrders(thresholdMinutes, maxAgeDays, batchSize);
         if (orders.isEmpty()) {
             return 0;
         }

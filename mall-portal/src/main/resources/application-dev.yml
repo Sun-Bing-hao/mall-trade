@@ -28,7 +28,9 @@ spring:
       timeout: 300ms # 连接超时时间（毫秒）
   rabbitmq:
     host: localhost
-    port: 5672
+    # 本机 5672 落在 Windows 保留端口区间（5664-5763，Hyper-V/WSL 占用），
+    # Docker 无法绑定，因此容器映射为 6072:5672，连接端同步改为 6072
+    port: 6072
 #    virtual-host: /mall
     username: mall
     password: mall

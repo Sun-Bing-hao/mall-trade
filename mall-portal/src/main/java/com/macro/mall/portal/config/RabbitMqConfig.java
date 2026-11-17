@@ -23,7 +23,7 @@ public class RabbitMqConfig {
     private static final int MAX_RETRY_ATTEMPTS = 3;
 
     /**
-     * 订单消息实际消费队列所绑定的交换机
+     * 订单消息实际消费队列所绑定的交换机(死信交换机)
      */
     @Bean
     public DirectExchange orderDirect() {
@@ -45,7 +45,7 @@ public class RabbitMqConfig {
     }
 
     /**
-     * 订单实际消费队列
+     * 订单实际消费队列（死信队列）
      */
     @Bean
     public Queue orderQueue() {
@@ -53,7 +53,7 @@ public class RabbitMqConfig {
     }
 
     /**
-     * 订单延迟队列（死信队列）
+     * 订单延迟队列
      */
     @Bean
     public Queue orderTtlQueue() {

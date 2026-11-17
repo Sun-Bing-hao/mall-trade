@@ -38,6 +38,7 @@
         WHERE status = 0
           AND delete_status = 0
           AND create_time &lt; DATE_SUB(NOW(), INTERVAL #{minutes} MINUTE)
+          AND create_time &gt; DATE_SUB(NOW(), INTERVAL #{maxAgeDays} DAY)
         ORDER BY create_time ASC
         LIMIT #{limit}
     </select>
