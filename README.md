@@ -1,214 +1,176 @@
-# mall
+# mall 电商交易系统 · 交易链路并发改造
 
-<p>
-  <a href="#公众号"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%85%AC%E4%BC%97%E5%8F%B7-macrozheng-blue.svg" alt="公众号"></a>
-  <a href="#公众号"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E4%BA%A4%E6%B5%81-%E5%BE%AE%E4%BF%A1%E7%BE%A4-2BA245.svg" alt="交流"></a>
-  <a href="https://github.com/macrozheng/mall-learning"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%AD%A6%E4%B9%A0%E6%95%99%E7%A8%8B-mall--learning-green.svg" alt="学习教程"></a>
-  <a href="https://github.com/macrozheng/mall-swarm"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/Cloud%E7%89%88%E6%9C%AC-mall--swarm-brightgreen.svg" alt="SpringCloud版本"></a>
-  <a href="https://github.com/macrozheng/mall-admin-web"><img src="https://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%90%8E%E5%8F%B0%E7%AE%A1%E7%90%86%E7%B3%BB%E7%BB%9F-mall--admin--web-green.svg" alt="后台管理系统"></a>
-  <a href="https://github.com/macrozheng/mall-app-web"><img src="https://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%89%8D%E5%8F%B0%E5%95%86%E5%9F%8E%E9%A1%B9%E7%9B%AE-mall--app--web-green.svg" alt="前台商城项目"></a>
-  <a href="https://gitee.com/macrozheng/mall"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E7%A0%81%E4%BA%91-%E9%A1%B9%E7%9B%AE%E5%9C%B0%E5%9D%80-orange.svg" alt="码云"></a>
-</p>
+> 基于开源项目 [macrozheng/mall](https://github.com/macrozheng/mall) 二次开发，聚焦「下单 — 支付 — 取消」主链路的**并发安全**与**可靠性**改造。
 
-## 友情提示
+原项目是一套功能完整的 B2C 电商系统，包含后台管理、前台商城、商品搜索等服务。本仓库在其基础上，针对交易链路中若干**会产生生产事故**的问题做了系统性改造，并补充了并发回归测试。
 
-> 1. **快速体验项目**：[在线访问地址](https://www.macrozheng.com/admin/index.html) 。
-> 2. **全套学习教程**：[《mall学习教程》](https://www.macrozheng.com) 。
-> 3. **视频教程**：[《mall视频教程》](https://www.macrozheng.com/mall/catalog/mall_video.html) 。
-> 4. **微服务版本**：基于Spring Cloud Alibaba的项目：[mall-swarm](https://github.com/macrozheng/mall-swarm) 。
-> 5. **分支说明**：`master`分支基于Spring Boot 3.5+JDK 17，`dev-v2`分支基于Spring Boot 2.7+JDK 8。
+---
 
-## 前言
+## 改造概览
 
-`mall`项目致力于打造一个完整的电商系统，采用现阶段主流技术实现。
+| 模块 | 原问题 | 改造手段 | 效果 |
+|---|---|---|---|
+| **库存并发** | 「查询-修改-写回」三步无原子性，200 并发下仅存留 3 个锁定量 | 条件更新合并校验与扣减 + Redis/Lua 预扣 + 定时对账 | 0 超卖，吞吐 269 → 649 req/s |
+| **缓存一致性** | Redis 与 MySQL 跨数据源，任一侧失败都会留下偏差 | 事务补偿 + 取消同步归还 + 定时对账，三层收敛 | 不一致窗口从 TTL 的 30 分钟降至 1 分钟 |
+| **超时取消** | 并发与消息重投导致重复释放库存；消息丢失则订单永久待付款 | 状态机 CAS + 事务 + 消费重试/失败转移 + 数据兜底扫描 | 四层保障闭环 |
+| **支付回调** | 已取消订单收到迟到回调会被「复活」为已支付，并重复扣减库存 | 状态机 CAS，拒绝非法状态流转 | 消除资损隐患 |
 
-## 项目文档
+---
 
-文档地址：[https://www.macrozheng.com](https://www.macrozheng.com)
+## 核心改造详解
 
-## 项目介绍
+### 一、库存并发安全
 
-`mall`项目是一套电商系统，包括前台商城系统及后台管理系统，基于SpringBoot+MyBatis实现，采用Docker容器化部署。前台商城系统包含首页门户、商品推荐、商品搜索、商品展示、购物车、订单流程、会员中心、客户服务、帮助中心等模块。后台管理系统包含商品管理、订单管理、会员管理、促销管理、运营管理、内容管理、统计报表、财务管理、权限管理、设置等模块。
+**问题**：原实现是典型的三步操作——
 
-### 项目演示
+```java
+PmsSkuStock skuStock = skuStockMapper.selectByPrimaryKey(skuId);  // 读
+skuStock.setLockStock(skuStock.getLockStock() + quantity);        // 改（内存）
+skuStockMapper.updateByPrimaryKeySelective(skuStock);             // 写回
+```
 
-#### 后台管理系统
+单线程正确，并发下两个请求读到同一个旧值，后写的覆盖先写的。压测 200 并发各买 1 件（库存 100），最终 `lock_stock` 只有 **3**，丢失率 98.5%。
 
-前端项目`mall-admin-web`地址：https://github.com/macrozheng/mall-admin-web
+**改造分三步，每一步解决不同层次的问题：**
 
-项目演示地址： [https://www.macrozheng.com/admin/index.html](https://www.macrozheng.com/admin/index.html)  
+**1. 条件更新 —— 先保证正确**
 
-![后台管理系统功能演示](./document/resource/mall_admin_show.png)
+```sql
+UPDATE pms_sku_stock
+   SET lock_stock = lock_stock + #{quantity}
+ WHERE id = #{skuId}
+   AND stock - lock_stock >= #{quantity}
+```
 
-#### 前台商城系统
+把「判断库存是否充足」和「扣减」合并为一条 SQL，由 InnoDB 行锁保证原子性；返回 0 即表示库存不足。同时补上了方法级 `@Transactional`——原实现没有事务，锁库存成功但订单落库失败时会造成库存永久泄漏。
 
-前端项目`mall-app-web`地址：https://github.com/macrozheng/mall-app-web
+**2. Redis + Lua 预扣 —— 再优化性能**
 
-项目演示地址（将浏览器切换为手机模式效果更佳）：[https://www.macrozheng.com/app/](https://www.macrozheng.com/app/)
+正确性解决后，瓶颈变成「所有请求都打数据库」。引入 Redis 预扣，用 Lua 脚本保证判断与扣减原子：
 
-![前台商城系统功能演示](./document/resource/re_mall_app_show.jpg)
+```lua
+local stock = redis.call('get', KEYS[1])
+if not stock then return -1 end                              -- key 不存在，回源加载
+if tonumber(stock) < tonumber(ARGV[1]) then return 0 end     -- 库存不足，直接拒绝
+redis.call('decrby', KEYS[1], ARGV[1])
+return 1
+```
 
-### 组织结构
+**Redis 只承担性能职责，正确性始终由数据库条件更新保证**——因此 Redis 故障时可以安全降级放行，不会超卖。另配合 SETNX 互斥回源防止缓存击穿。
+
+**3. 定时对账 —— 收敛偏差**
+
+跨数据源不存在分布式事务，偏差无法完全避免。每 5 分钟扫描缓存 key，与数据库 `stock - lock_stock` 比对，不一致则以数据库为准覆盖。修正方向恒为「向数据库靠拢」，保证最坏情况是缓存偏高（多放几个请求进数据库被拒），不会偏低导致少卖。
+
+**验证**：`StockLockAtomicTest`（200 并发，断言 0 超卖）、`StockRedisDeductTest`（吞吐与拦截率）、`StockReconcileTest`（偏差修正）。
+
+---
+
+### 二、缓存一致性
+
+偏差有四个来源：下单事务回滚、归还 Redis 失败、后台直接改库存、缓存重建时读到未提交数据。针对不同阶段分别处理：
+
+| 场景 | 手段 | 时机 |
+|---|---|---|
+| 下单过程中失败 | catch 中立即归还 | 失败已确定 |
+| 下单后续步骤失败（如订单落库） | 注册事务回调归还 | `afterCompletion == ROLLED_BACK` |
+| 订单取消 | 归还推迟到 `afterCommit` | 事务提交成功后才执行 |
+| 残留偏差 | 定时对账修正 | 每 5 分钟 |
+
+**关键设计**：失败确定时立即补偿，成功确定后才执行补偿。若取消订单时在事务内直接归还，一旦事务回滚就会出现「数据库仍占用、缓存已释放」的可售量虚高。
+
+归还前还会检查 key 是否存在——`INCR` 对不存在的 key 会从 0 创建，若缓存已过期时直接 `increment`，会让该 SKU 的可售量凭空变成 1。
+
+---
+
+### 三、订单超时取消链路
+
+原实现用「先查 status=0 再更新」，并发或消息重投时会重复释放库存。改造后形成四层保障：
+
+| 层 | 手段 | 解决的问题 |
+|---|---|---|
+| 1 | 状态机 CAS：`UPDATE ... WHERE status = 0` + 判断影响行数 | 重复调用、并发取消 |
+| 2 | `@Transactional` 包裹状态变更与库存/优惠券/积分回退 | 中途失败导致数据不一致 |
+| 3 | 消费端重试 3 次（1s/2s 退避）+ 失败转投兜底队列 | 异常消息无限重投堵塞消费者 |
+| 4 | 定时扫描数据库中超时未支付订单，逐笔走同一套取消逻辑 | 消息丢失导致订单永久待付款 |
+
+第 4 层是**从「消息驱动」到「状态驱动」的转变**：消息可能丢、可能重复、可能乱序，但数据库里「status=0 且创建时间早于某时刻」这个事实不会骗人。
+
+扫描任务的设计细节：
+- **宽限期**：阈值 = 超时时间 + 5 分钟，让延迟消息先有机会处理，避免无效竞争
+- **组合索引**：`(status, delete_status, create_time)`，实测执行计划由 `ALL` 变为 `range`，扫描行数与订单总量无关
+- **时间下界**：只扫最近 7 天，防止历史脏数据每轮占满批次名额
+- **逐笔隔离**：单笔失败不影响同批其他订单
+
+---
+
+### 四、支付回调状态校验
+
+**问题**：`paySuccess` 使用 `updateByPrimaryKeySelective` 直接改状态，没有任何条件——
+
+一笔已超时取消（`status=4`）的订单收到迟到的支付回调时，会被改成「已支付」，同时真实库存被扣减、`lock_stock` 被减为**负数**。用户付了钱、订单已关闭、货已卖给别人。
+
+**改造**：改为专用 SQL + 状态机 CAS，影响行数为 0 时直接返回，不执行任何库存操作；同时补充事务，保证状态流转与库存扣减同生共死。重复回调（支付平台重推）天然幂等。
+
+此外收敛了 `/order/paySuccess` 这个对外暴露的接口——真实支付回调走 `/alipay/notify`，该接口属于多余入口，且可被用于伪造支付。
+
+---
+
+## 技术栈
+
+| 分类 | 技术 |
+|---|---|
+| 语言 / 框架 | Java 17、Spring Boot 3.5、MyBatis、Spring Security + JWT |
+| 数据存储 | MySQL 8（交易数据）、Redis（缓存）、MongoDB（收藏/关注/浏览记录）、Elasticsearch（商品搜索，独立服务） |
+| 消息中间件 | RabbitMQ（TTL + 死信实现延迟任务、消费重试与失败转移） |
+| 构建 / 测试 | Maven、JUnit 5、Docker |
+
+## 项目结构
 
 ```
 mall
-├── mall-common -- 工具类及通用代码
-├── mall-mbg -- MyBatisGenerator生成的数据库操作代码
-├── mall-security -- SpringSecurity封装公用模块
-├── mall-admin -- 后台商城管理系统接口
-├── mall-search -- 基于Elasticsearch的商品搜索系统
-├── mall-portal -- 前台商城系统接口
-└── mall-demo -- 框架搭建时的测试代码
+├── mall-common      公共模块：统一返回、全局异常、Redis 封装
+├── mall-mbg         MyBatis Generator 生成的实体与 Mapper（76 张表）
+├── mall-security    JWT 认证与动态 RBAC 权限
+├── mall-admin       后台管理服务（8080）
+├── mall-portal      前台商城服务（8085）  ← 本次改造主要集中在此
+├── mall-search      商品搜索服务（8081，依赖 Elasticsearch）
+└── document         数据库脚本、设计文档
 ```
 
-### 技术选型
+## 本地运行
 
-#### 后端技术
+**依赖**：MySQL 8、Redis、RabbitMQ、MongoDB（MongoDB 仅影响收藏/关注/浏览记录，不影响交易链路）
 
-| 技术                 | 说明                | 官网                                           |
-| -------------------- | ------------------- | ---------------------------------------------- |
-| SpringBoot           | Web应用开发框架      | https://spring.io/projects/spring-boot         |
-| SpringSecurity       | 认证和授权框架      | https://spring.io/projects/spring-security     |
-| MyBatis              | ORM框架             | http://www.mybatis.org/mybatis-3/zh/index.html |
-| MyBatisGenerator     | 数据层代码生成器     | http://www.mybatis.org/generator/index.html    |
-| Elasticsearch        | 搜索引擎            | https://github.com/elastic/elasticsearch       |
-| RabbitMQ             | 消息队列            | https://www.rabbitmq.com/                      |
-| Redis                | 内存数据存储         | https://redis.io/                              |
-| MongoDB              | NoSql数据库         | https://www.mongodb.com                        |
-| LogStash             | 日志收集工具        | https://github.com/elastic/logstash            |
-| Kibana               | 日志可视化查看工具  | https://github.com/elastic/kibana              |
-| Nginx                | 静态资源服务器      | https://www.nginx.com/                         |
-| Docker               | 应用容器引擎        | https://www.docker.com                         |
-| Jenkins              | 自动化部署工具      | https://github.com/jenkinsci/jenkins           |
-| Druid                | 数据库连接池        | https://github.com/alibaba/druid               |
-| OSS                  | 对象存储            | https://github.com/aliyun/aliyun-oss-java-sdk  |
-| MinIO                | 对象存储            | https://github.com/minio/minio                 |
-| JWT                  | JWT登录支持         | https://github.com/jwtk/jjwt                   |
-| Lombok               | Java语言增强库      | https://github.com/rzwitserloot/lombok         |
-| Hutool               | Java工具类库        | https://github.com/looly/hutool                |
-| PageHelper           | MyBatis物理分页插件 | http://git.oschina.net/free/Mybatis_PageHelper |
-| SpringDoc            | API文档生成工具      | https://github.com/springdoc/springdoc-openapi |
-| Hibernator-Validator | 验证框架            | http://hibernate.org/validator                 |
+```bash
+# 1. 启动中间件
+docker run -d --name redis   -p 6379:6379  redis:7 --requirepass 123456
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=mall -e RABBITMQ_DEFAULT_PASS=mall rabbitmq:3.10-management
+docker run -d --name mongo   -p 27017:27017 mongo:6
 
-#### 前端技术
+# 2. 初始化数据库
+mysql -uroot -p < document/sql/mall.sql
+mysql -uroot -p < document/sql/2026-11-12-add-order-scan-index.sql
 
-| 技术       | 说明                  | 官网                                   |
-| ---------- | --------------------- | -------------------------------------- |
-| Vue        | 前端框架              | https://vuejs.org/                     |
-| Vue-router | 路由框架              | https://router.vuejs.org/              |
-| Vuex       | 全局状态管理框架      | https://vuex.vuejs.org/                |
-| Element    | 前端UI框架            | https://element.eleme.io               |
-| Axios      | 前端HTTP框架          | https://github.com/axios/axios         |
-| v-charts   | 基于Echarts的图表框架 | https://v-charts.js.org/               |
-| Js-cookie  | cookie管理工具        | https://github.com/js-cookie/js-cookie |
-| nprogress  | 进度条控件            | https://github.com/rstacruz/nprogress  |
+# 3. 启动服务
+mvn clean package -DskipTests
+java -jar mall-portal/target/mall-portal.jar
+```
 
-#### 移动端技术
+启动后访问 `http://localhost:8085/swagger-ui.html` 调试接口，RabbitMQ 管理台在 `http://localhost:15672`（mall/mall）。
 
-| 技术         | 说明             | 官网                                    |
-| ------------ | ---------------- | --------------------------------------- |
-| Vue          | 核心前端框架     | https://vuejs.org                       |
-| Vuex         | 全局状态管理框架 | https://vuex.vuejs.org                  |
-| uni-app      | 移动端前端框架   | https://uniapp.dcloud.io                |
-| mix-mall     | 电商项目模板     | https://ext.dcloud.net.cn/plugin?id=200 |
-| luch-request | HTTP请求框架     | https://github.com/lei-mu/luch-request  |
+> **端口提示**：若本机 5672 被 Windows 保留端口区间占用（`netsh interface ipv4 show excludedportrange protocol=tcp` 可查），需将容器映射改为其他端口，并同步修改 `application-dev.yml`。
 
-#### 架构图
+## 已知未完成项
 
-##### 系统架构图
+以下问题已识别，权衡投入产出后暂未处理：
 
-![系统架构图](./document/resource/re_mall_system_arch.jpg)
+- **延迟队列的队头阻塞**：TTL + 死信方案下，同一队列中长 TTL 消息会阻塞后续短 TTL 消息。彻底解决需改用 RocketMQ 延迟消息或 RabbitMQ 延迟插件。
+- **订单快照依赖前端传参**：`oms_order_item` 的商品名称、价格等字段由客户端传入，理论上可篡改，应由服务端回查商品表。
+- **下单接口未做幂等**：用户重复提交会生成多笔订单，可引入业务唯一键或 token 机制。
+- **消息发送未开启 publisher confirm**：当前依赖数据库兜底扫描保证最终结果，可补充 confirm 以缩短故障发现时间。
 
-##### 业务架构图
+## 致谢
 
-![业务架构图](./document/resource/re_mall_business_arch.jpg)
-
-#### 模块介绍
-
-##### 后台管理系统 `mall-admin`
-
-- 商品管理：[功能结构图-商品.jpg](document/resource/mind_product.jpg)
-- 订单管理：[功能结构图-订单.jpg](document/resource/mind_order.jpg)
-- 促销管理：[功能结构图-促销.jpg](document/resource/mind_sale.jpg)
-- 内容管理：[功能结构图-内容.jpg](document/resource/mind_content.jpg)
-- 用户管理：[功能结构图-用户.jpg](document/resource/mind_member.jpg)
-
-##### 前台商城系统 `mall-portal`
-
-[功能结构图-前台.jpg](document/resource/mind_portal.jpg)
-
-#### 开发进度
-
-![项目开发进度图](./document/resource/re_mall_dev_flow.jpg)
-
-## 环境搭建
-
-### 开发工具
-
-| 工具          | 说明                | 官网                                            |
-| ------------- | ------------------- | ----------------------------------------------- |
-| IDEA          | 开发IDE             | https://www.jetbrains.com/idea/download         |
-| RedisDesktop  | redis客户端连接工具 | https://github.com/qishibo/AnotherRedisDesktopManager  |
-| Robomongo     | mongo客户端连接工具 | https://robomongo.org/download                  |
-| SwitchHosts   | 本地host管理        | https://oldj.github.io/SwitchHosts/             |
-| X-shell       | Linux远程连接工具   | http://www.netsarang.com/download/software.html |
-| Navicat       | 数据库连接工具      | http://www.formysql.com/xiazai.html             |
-| PowerDesigner | 数据库设计工具      | http://powerdesigner.de/                        |
-| Axure         | 原型设计工具        | https://www.axure.com/                          |
-| MindMaster    | 思维导图设计工具    | http://www.edrawsoft.cn/mindmaster              |
-| ScreenToGif   | gif录制工具         | https://www.screentogif.com/                    |
-| ProcessOn     | 流程图绘制工具      | https://www.processon.com/                      |
-| PicPick       | 图片处理工具        | https://picpick.app/zh/                         |
-| Snipaste      | 屏幕截图工具        | https://www.snipaste.com/                       |
-| Postman       | API接口调试工具      | https://www.postman.com/                        |
-| Typora        | Markdown编辑器      | https://typora.io/                              |
-
-### 开发环境
-
-| 工具          | 版本号 | 下载                                                         |
-| ------------- | ------ | ------------------------------------------------------------ |
-| JDK           | 17     | https://www.oracle.com/java/technologies/javase/jdk17-archive-downloads.html |
-| MySQL         | 5.7    | https://www.mysql.com/                                       |
-| Redis         | 7.0    | https://redis.io/download                                    |
-| MongoDB       | 5.0    | https://www.mongodb.com/download-center                      |
-| RabbitMQ      | 3.10.5 | http://www.rabbitmq.com/download.html                        |
-| Nginx         | 1.22   | http://nginx.org/en/download.html                            |
-| Elasticsearch | 7.17.3 | https://www.elastic.co/downloads/elasticsearch               |
-| Logstash      | 7.17.3 | https://www.elastic.co/cn/downloads/logstash                 |
-| Kibana        | 7.17.3 | https://www.elastic.co/cn/downloads/kibana                   |
-
-### 搭建步骤
-
-> Windows环境部署
-
-- Windows环境搭建请参考：[mall在Windows环境下的部署](https://www.macrozheng.com/mall/deploy/mall_deploy_windows.html);
-- 注意：如果只启动`mall-admin`模块，仅需安装MySQL、Redis即可;
-- 克隆`mall-admin-web`项目，并导入到IDEA中完成编译：[前端项目地址](https://github.com/macrozheng/mall-admin-web);
-- `mall-admin-web`项目的安装及部署请参考：[mall前端项目的安装与部署](https://www.macrozheng.com/mall/deploy/mall_deploy_web.html) 。
-
-> Docker环境部署
-
-- 使用虚拟机安装CentOS7.6请参考：[虚拟机安装及使用Linux，看这一篇就够了](https://www.macrozheng.com/tool/linux_install.html);
-- 本项目Docker镜像构建请参考：[使用Maven插件为SpringBoot应用构建Docker镜像](https://www.macrozheng.com/project/maven_docker_fabric8.html);
-- 本项目在Docker容器下的部署请参考：[mall在Linux环境下的部署（基于Docker容器）](https://www.macrozheng.com/mall/deploy/mall_deploy_docker.html);
-- 本项目使用Docker Compose请参考： [mall在Linux环境下的部署（基于Docker Compose）](https://www.macrozheng.com/mall/deploy/mall_deploy_docker_compose.html);
-- 本项目在Linux下的自动化部署请参考：[mall在Linux环境下的自动化部署（基于Jenkins）](https://www.macrozheng.com/mall/deploy/mall_deploy_jenkins.html);
-
-> 相关环境部署
-
-- ELK日志收集系统的搭建请参考：[mall项目ELK日志收集解决方案](https://www.macrozheng.com/project/mall_kibana_start.html);
-- 使用MinIO存储文件请参考：[使用MinIO实现文件存储](https://www.macrozheng.com/project/minio_console_start.html);
-- 读写分离解决方案请参考：[你还在代码里做读写分离么，试试这个中间件吧](https://www.macrozheng.com/project/gaea.html);
-- Redis集群解决方案请参考：[Docker环境下秒建Redis集群](https://www.macrozheng.com/blog/redis_cluster.html) 。
-
-## 公众号
-
-加微信群交流，关注公众号「**macrozheng**」，回复「**加群**」即可。
-
-![公众号图片](./document/resource/qrcode_for_macrozheng_258.jpg)
-
-## 许可证
-
-[Apache License 2.0](https://github.com/macrozheng/mall/blob/master/LICENSE)
-
-Copyright (c) 2018-2026 macrozheng
+原项目 [macrozheng/mall](https://github.com/macrozheng/mall) 提供了完整的电商业务骨架与工程结构，本仓库在此基础上进行交易链路的改造实践。遵循 Apache License 2.0。
